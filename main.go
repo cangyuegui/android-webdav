@@ -111,14 +111,6 @@ func (t *IPAuthTracker) LoadBlockedIPs() error {
 
 // 保存拉黑IP到文件（Base64编码）
 func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
-	t.mu.RLock()
-	// 检查是否已拉黑
-	if t.blockedIPs[ip] {
-		t.mu.RUnlock()
-		return nil
-	}
-	t.mu.RUnlock()
-
 	// Base64编码IP
 	encodedIP := base64.StdEncoding.EncodeToString([]byte(ip))
 
