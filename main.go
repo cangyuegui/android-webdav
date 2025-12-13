@@ -127,13 +127,6 @@ func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
 		return fmt.Errorf("无效的IP地址: %s", ip)
 	}
 
-	t.mu.RLock()
-	if t.blockedIPs[ip] {
-		t.mu.RUnlock()
-		return nil
-	}
-	t.mu.RUnlock()
-
 	// Base64编码IP
 	encodedIP := base64.StdEncoding.EncodeToString([]byte(ip))
 
