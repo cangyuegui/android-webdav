@@ -1,32 +1,255 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"golang.org/x/net/webdav"
 )
 
 // 配置结构体
 type Config struct {
-	ssl      bool
-	certFile string
-	keyFile  string
-	addr     string
-	rootDir  string
-	username string
-	password string
+	ssl       bool
+	certFile  string
+	keyFile   string
+	addr      string
+	rootDir   string
+	username  string
+	password  string
+	blockDir  string // 拉黑IP存储目录
+	blockFile string // 拉黑IP存储文件
+}
+
+// IP认证错误记录器
+type IPAuthTracker struct {
+	mu          sync.RWMutex
+	failedCount map[string]int  // IP -> 失败次数
+	blockedIPs  map[string]bool // 已拉黑IP
+	blockFile   string          // 拉黑IP存储文件路径
 }
 
 // 只读文件系统包装器，禁用所有写操作（适配新版API）
 type ReadOnlyFileSystem struct {
 	webdav.FileSystem
+}
+
+// 初始化IP追踪器
+func NewIPAuthTracker(blockFile string) (*IPAuthTracker, error) {
+	tracker := &IPAuthTracker{
+		failedCount: make(map[string]int),
+		blockedIPs:  make(map[string]bool),
+		blockFile:   blockFile,
+	}
+
+	// 启动时加载已拉黑的IP
+	if err := tracker.LoadBlockedIPs(); err != nil {
+		return nil, fmt.Errorf("加载拉黑IP失败: %v", err)
+	}
+
+	return tracker, nil
+}
+
+// 加载拉黑IP文件（Base64解码）
+func (t *IPAuthTracker) LoadBlockedIPs() error {
+	// 检查文件是否存在
+	if _, err := os.Stat(t.blockFile); os.IsNotExist(err) {
+		log.Printf("拉黑IP文件不存在，将创建新文件: %s", t.blockFile)
+		return nil
+	}
+
+	// 读取文件内容
+	data, err := os.ReadFile(t.blockFile)
+	if err != nil {
+		return fmt.Errorf("读取拉黑IP文件失败: %v", err)
+	}
+
+	// 按行解析（每行一个Base64编码的IP）
+	lines := []byte(data)
+	var ipStr string
+	for len(lines) > 0 {
+		// 分割行
+		n := len(lines)
+		if i := bytes.IndexByte(lines, '\n'); i >= 0 {
+			n = i
+		}
+		line := lines[:n]
+		lines = lines[n+1:]
+
+		// 跳过空行
+		if len(line) == 0 {
+			continue
+		}
+
+		// Base64解码
+		ipBytes, err := base64.StdEncoding.DecodeString(string(line))
+		if err != nil {
+			log.Printf("Base64解码IP失败，跳过该行: %s, 错误: %v", string(line), err)
+			continue
+		}
+
+		ipStr = string(ipBytes)
+		t.mu.Lock()
+		t.blockedIPs[ipStr] = true
+		t.mu.Unlock()
+		log.Printf("加载拉黑IP: %s", ipStr)
+	}
+
+	log.Printf("共加载 %d 个拉黑IP", len(t.blockedIPs))
+	return nil
+}
+
+// 保存拉黑IP到文件（Base64编码）
+func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
+	t.mu.RLock()
+	// 检查是否已拉黑
+	if t.blockedIPs[ip] {
+		t.mu.RUnlock()
+		return nil
+	}
+	t.mu.RUnlock()
+
+	// Base64编码IP
+	encodedIP := base64.StdEncoding.EncodeToString([]byte(ip))
+
+	// 追加写入文件（每行一个）
+	f, err := os.OpenFile(t.blockFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("打开拉黑IP文件失败: %v", err)
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(encodedIP + "\n")
+	if err != nil {
+		return fmt.Errorf("写入拉黑IP文件失败: %v", err)
+	}
+
+	// 更新内存中的拉黑列表
+	t.mu.Lock()
+	t.blockedIPs[ip] = true
+	// 清除该IP的失败次数
+	delete(t.failedCount, ip)
+	t.mu.Unlock()
+
+	log.Printf("IP已拉黑并保存: %s (Base64: %s)", ip, encodedIP)
+	return nil
+}
+
+// 记录认证失败并检查是否需要拉黑（三次失败拉黑）
+func (t *IPAuthTracker) RecordFailedAuth(ip string) (bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// 检查是否已拉黑
+	if t.blockedIPs[ip] {
+		return true, nil
+	}
+
+	// 增加失败次数
+	t.failedCount[ip]++
+	count := t.failedCount[ip]
+	log.Printf("IP %s 认证失败次数: %d", ip, count)
+
+	// 三次失败则拉黑
+	if count >= 3 {
+		t.blockedIPs[ip] = true
+		// 异步保存到文件（避免阻塞请求）
+		go func(ip string) {
+			if err := t.SaveBlockedIP(ip); err != nil {
+				log.Printf("保存拉黑IP失败: %v", err)
+			}
+		}(ip)
+		log.Printf("IP %s 因三次认证失败被永久拉黑", ip)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// 检查IP是否被拉黑
+func (t *IPAuthTracker) IsBlocked(ip string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.blockedIPs[ip]
+}
+
+// 获取客户端真实IP
+func getClientIP(r *http.Request) string {
+	// 优先获取X-Forwarded-For（反向代理场景）
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// 取第一个IP
+		if i := strings.Index(xff, ","); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// 其次获取X-Real-IP
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// 直接获取远程地址
+	remoteAddr := r.RemoteAddr
+	// 解析IP:端口
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return ip
+}
+
+// 带IP拉黑的认证中间件
+func authWithIPBlock(next http.Handler, validUser, validPass string, tracker *IPAuthTracker) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1. 获取客户端IP
+		clientIP := getClientIP(r)
+		log.Printf("收到请求，客户端IP: %s, 路径: %s", clientIP, r.URL.Path)
+
+		// 2. 检查IP是否被拉黑
+		if tracker.IsBlocked(clientIP) {
+			http.Error(w, "请继续再次尝试连接", http.StatusForbidden)
+			log.Printf("拉黑IP %s 尝试访问，已拒绝", clientIP)
+			return
+		}
+
+		// 3. 验证账号密码
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != validUser || pass != validPass {
+			// 记录认证失败
+			isBlocked, err := tracker.RecordFailedAuth(clientIP)
+			if err != nil {
+				log.Printf("记录认证失败失败: %v", err)
+			}
+
+			// 拉黑则返回403，否则返回401
+			if isBlocked {
+				http.Error(w, "请继续再次尝试连接，重试连接", http.StatusForbidden)
+			} else {
+				w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV Server"`)
+				http.Error(w, "认证失败", http.StatusUnauthorized)
+			}
+			return
+		}
+
+		// 4. 认证成功，清除失败次数
+		tracker.mu.Lock()
+		delete(tracker.failedCount, clientIP)
+		tracker.mu.Unlock()
+
+		// 5. 处理请求
+		next.ServeHTTP(w, r)
+	})
 }
 
 // 重写Mkdir方法，返回权限错误（新版API使用context.Context）
@@ -70,19 +293,6 @@ func validateCredentials(username, password string) error {
 	return nil
 }
 
-// 基本认证中间件
-func basicAuth(next http.Handler, validUser, validPass string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, pass, ok := r.BasicAuth()
-		if !ok || user != validUser || pass != validPass {
-			w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV Server"`)
-			http.Error(w, "认证失败", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func main() {
 	// 定义命令行参数
 	var config Config
@@ -111,12 +321,30 @@ func main() {
 	// 设置WebDAV根目录为可执行文件同级的FILES文件夹
 	config.rootDir = filepath.Join(exeDir, "FILES")
 
-	// 检查FILES目录是否存在，不存在则创建（权限0755：只读给其他用户，可读写给所有者）
+	// 设置拉黑IP存储目录和文件（exe同级/his_store_bak/blocked_ips.txt）
+	config.blockDir = filepath.Join(exeDir, "his_store_bak")
+	config.blockFile = filepath.Join(config.blockDir, "blocked_ips.txt")
+
+	// 检查FILES目录是否存在，不存在则创建
 	if _, err := os.Stat(config.rootDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(config.rootDir, 0755); err != nil {
 			log.Fatalf("创建FILES目录失败: %v", err)
 		}
 		log.Printf("已创建FILES目录: %s", config.rootDir)
+	}
+
+	// 检查拉黑IP目录是否存在，不存在则创建
+	if _, err := os.Stat(config.blockDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(config.blockDir, 0755); err != nil {
+			log.Fatalf("创建拉黑IP目录失败: %v", err)
+		}
+		log.Printf("已创建拉黑IP目录: %s", config.blockDir)
+	}
+
+	// 初始化IP认证追踪器
+	tracker, err := NewIPAuthTracker(config.blockFile)
+	if err != nil {
+		log.Fatalf("初始化IP追踪器失败: %v", err)
 	}
 
 	// 创建只读文件系统实例
@@ -135,8 +363,8 @@ func main() {
 		},
 	}
 
-	// 包装认证中间件，强制所有请求必须认证
-	authHandler := basicAuth(handler, config.username, config.password)
+	// 包装带IP拉黑的认证中间件
+	authHandler := authWithIPBlock(handler, config.username, config.password, tracker)
 
 	// 打印启动信息
 	log.Printf("=== WebDAV 服务器启动配置 ===")
@@ -144,6 +372,8 @@ func main() {
 	log.Printf("文件根目录: %s", config.rootDir)
 	log.Printf("SSL加密: %t", config.ssl)
 	log.Printf("认证用户: %s", config.username)
+	log.Printf("拉黑IP存储文件: %s", config.blockFile)
+	log.Printf("当前拉黑IP数量: %d", len(tracker.blockedIPs))
 	log.Printf("==============================")
 
 	// 根据SSL配置启动服务器
