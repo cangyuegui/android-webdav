@@ -14,29 +14,33 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/webdav"
 )
 
 // 配置结构体
 type Config struct {
-	ssl       bool
-	certFile  string
-	keyFile   string
-	addr      string
-	rootDir   string
-	username  string
-	password  string
-	blockDir  string // 拉黑IP存储目录
-	blockFile string // 拉黑IP存储文件
+	ssl        bool
+	certFile   string
+	keyFile    string
+	addr       string
+	rootDir    string
+	username   string
+	password   string
+	blockDir   string // 拉黑IP存储目录
+	blockFile  string // 拉黑IP存储文件
+	sysLogFile string // 系统日志文件
 }
 
 // IP认证错误记录器
 type IPAuthTracker struct {
-	mu          sync.RWMutex
-	failedCount map[string]int  // IP -> 失败次数
-	blockedIPs  map[string]bool // 已拉黑IP
-	blockFile   string          // 拉黑IP存储文件路径
+	mu                    sync.RWMutex
+	failedCount           map[string]int  // IP -> 失败次数
+	blockedIPs            map[string]bool // 已拉黑IP
+	blockFile             string          // 拉黑IP存储文件路径
+	sysLogFile            string          // 系统日志文件路径
+	selfDestructThreshold int             // 自裁保护阈值（拉黑IP数量）
 }
 
 // 只读文件系统包装器，禁用所有写操作（适配新版API）
@@ -45,17 +49,32 @@ type ReadOnlyFileSystem struct {
 }
 
 // 初始化IP追踪器
-func NewIPAuthTracker(blockFile string) (*IPAuthTracker, error) {
+func NewIPAuthTracker(blockFile, sysLogFile string) (*IPAuthTracker, error) {
+	// 主动创建空的拉黑IP文件（若不存在）
+	if _, err := os.Stat(blockFile); os.IsNotExist(err) {
+		f, err := os.OpenFile(blockFile, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("创建拉黑IP文件失败: %v", err)
+		}
+		f.Close()
+		log.Printf("已创建空的拉黑IP文件: %s", blockFile)
+	}
+
 	tracker := &IPAuthTracker{
-		failedCount: make(map[string]int),
-		blockedIPs:  make(map[string]bool),
-		blockFile:   blockFile,
+		failedCount:           make(map[string]int),
+		blockedIPs:            make(map[string]bool),
+		blockFile:             blockFile,
+		sysLogFile:            sysLogFile,
+		selfDestructThreshold: 50, // 拉黑IP达到50个触发自裁保护
 	}
 
 	// 启动时加载已拉黑的IP
 	if err := tracker.LoadBlockedIPs(); err != nil {
 		return nil, fmt.Errorf("加载拉黑IP失败: %v", err)
 	}
+
+	// 检查初始拉黑IP数量是否已达阈值
+	tracker.checkSelfDestruct()
 
 	return tracker, nil
 }
@@ -64,7 +83,7 @@ func NewIPAuthTracker(blockFile string) (*IPAuthTracker, error) {
 func (t *IPAuthTracker) LoadBlockedIPs() error {
 	// 检查文件是否存在
 	if _, err := os.Stat(t.blockFile); os.IsNotExist(err) {
-		log.Printf("拉黑IP文件不存在，将创建新文件: %s", t.blockFile)
+		log.Printf("拉黑IP文件不存在: %s", t.blockFile)
 		return nil
 	}
 
@@ -75,18 +94,10 @@ func (t *IPAuthTracker) LoadBlockedIPs() error {
 	}
 
 	// 按行解析（每行一个Base64编码的IP）
-	lines := []byte(data)
-	var ipStr string
-	for len(lines) > 0 {
-		// 分割行
-		n := len(lines)
-		if i := bytes.IndexByte(lines, '\n'); i >= 0 {
-			n = i
-		}
-		line := lines[:n]
-		lines = lines[n+1:]
-
-		// 跳过空行
+	lines := bytes.Split(data, []byte("\n"))
+	for _, line := range lines {
+		// 跳过空行/空白行
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -98,7 +109,7 @@ func (t *IPAuthTracker) LoadBlockedIPs() error {
 			continue
 		}
 
-		ipStr = string(ipBytes)
+		ipStr := string(ipBytes)
 		t.mu.Lock()
 		t.blockedIPs[ipStr] = true
 		t.mu.Unlock()
@@ -111,6 +122,18 @@ func (t *IPAuthTracker) LoadBlockedIPs() error {
 
 // 保存拉黑IP到文件（Base64编码）
 func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
+	// IP格式校验
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("无效的IP地址: %s", ip)
+	}
+
+	t.mu.RLock()
+	if t.blockedIPs[ip] {
+		t.mu.RUnlock()
+		return nil
+	}
+	t.mu.RUnlock()
+
 	// Base64编码IP
 	encodedIP := base64.StdEncoding.EncodeToString([]byte(ip))
 
@@ -134,7 +157,39 @@ func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
 	t.mu.Unlock()
 
 	log.Printf("IP已拉黑并保存: %s (Base64: %s)", ip, encodedIP)
+
+	// 检查是否触发自裁保护
+	t.checkSelfDestruct()
+
 	return nil
+}
+
+// 检查拉黑IP数量是否达到自裁阈值
+func (t *IPAuthTracker) checkSelfDestruct() {
+	t.mu.RLock()
+	blockedCount := len(t.blockedIPs)
+	t.mu.RUnlock()
+
+	if blockedCount >= t.selfDestructThreshold {
+		// 写入sys.log日志（中英文）
+		logMsg := fmt.Sprintf("[%s] 遭遇攻击，自裁保护 | Under attack, self-destruct protection triggered. 拉黑IP数量: %d",
+			time.Now().Format("2006-01-02 15:04:05"), blockedCount)
+
+		// 追加写入sys.log
+		f, err := os.OpenFile(t.sysLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Printf("写入sys.log失败: %v", err)
+		} else {
+			f.WriteString(logMsg + "\n")
+			f.Close()
+		}
+
+		// 控制台打印日志
+		log.Println(logMsg)
+
+		// 自裁保护：退出程序
+		log.Fatal("自裁保护触发，程序退出 | Self-destruct protection triggered, exiting program.")
+	}
 }
 
 // 记录认证失败并检查是否需要拉黑（三次失败拉黑）
@@ -316,6 +371,8 @@ func main() {
 	// 设置拉黑IP存储目录和文件（exe同级/his_store_bak/blocked_ips.txt）
 	config.blockDir = filepath.Join(exeDir, "his_store_bak")
 	config.blockFile = filepath.Join(config.blockDir, "blocked_ips.txt")
+	// 设置系统日志文件（exe同级/sys.log）
+	config.sysLogFile = filepath.Join(exeDir, "sys.log")
 
 	// 检查FILES目录是否存在，不存在则创建
 	if _, err := os.Stat(config.rootDir); os.IsNotExist(err) {
@@ -333,8 +390,8 @@ func main() {
 		log.Printf("已创建拉黑IP目录: %s", config.blockDir)
 	}
 
-	// 初始化IP认证追踪器
-	tracker, err := NewIPAuthTracker(config.blockFile)
+	// 初始化IP认证追踪器（传入系统日志文件路径）
+	tracker, err := NewIPAuthTracker(config.blockFile, config.sysLogFile)
 	if err != nil {
 		log.Fatalf("初始化IP追踪器失败: %v", err)
 	}
@@ -365,6 +422,8 @@ func main() {
 	log.Printf("SSL加密: %t", config.ssl)
 	log.Printf("认证用户: %s", config.username)
 	log.Printf("拉黑IP存储文件: %s", config.blockFile)
+	log.Printf("系统日志文件: %s", config.sysLogFile)
+	log.Printf("自裁保护阈值: %d个拉黑IP", tracker.selfDestructThreshold)
 	log.Printf("当前拉黑IP数量: %d", len(tracker.blockedIPs))
 	log.Printf("==============================")
 
