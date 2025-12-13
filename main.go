@@ -265,6 +265,11 @@ func authWithIPBlock(next http.Handler, validUser, validPass string, tracker *IP
 
 		// 3. 验证账号密码
 		user, pass, ok := r.BasicAuth()
+	    // 新增：第一步就拦截含..的URL，直接拒绝
+		if strings.Contains(r.URL.Path, "..") {
+			ok = false
+		}
+		
 		if !ok || user != validUser || pass != validPass {
 			// 记录认证失败
 			isBlocked, err := tracker.RecordFailedAuth(clientIP)
