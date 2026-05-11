@@ -228,8 +228,8 @@ func getClientIP(r *http.Request) string {
 	// 优先获取X-Forwarded-For（反向代理场景）
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		// 取第一个IP
-		if i := strings.Index(xff, ","); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+		if before, _, ok := strings.Cut(xff, ","); ok {
+			return strings.TrimSpace(before)
 		}
 		return strings.TrimSpace(xff)
 	}
@@ -265,11 +265,11 @@ func authWithIPBlock(next http.Handler, validUser, validPass string, tracker *IP
 
 		// 3. 验证账号密码
 		user, pass, ok := r.BasicAuth()
-	    // 新增：第一步就拦截含..的URL，直接拒绝
+		// 新增：第一步就拦截含..的URL，直接拒绝
 		if strings.Contains(r.URL.Path, "..") {
 			ok = false
 		}
-		
+
 		if !ok || user != validUser || pass != validPass {
 			// 记录认证失败
 			isBlocked, err := tracker.RecordFailedAuth(clientIP)
@@ -348,8 +348,8 @@ func main() {
 	flag.Parse()
 
 	// 内置账号密码（满足长度要求：用户6位+，密码14位+）
-	config.username = "aloofuser"
-	config.password = "78.$%#1@12345688_*"
+	config.username = "webdavuser"
+	config.password = "71235*&^-12-NNjj_VVV"
 
 	// 验证内置账号密码长度
 	if err := validateCredentials(config.username, config.password); err != nil {
