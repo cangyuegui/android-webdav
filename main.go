@@ -10,8 +10,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,36 +30,38 @@ type Config struct {
 	rootDir    string
 	username   string
 	password   string
-	blockDir   string // 拉黑IP存储目录
-	blockFile  string // 拉黑IP存储文件
-	sysLogFile string // 系统日志文件
+	blockDir   string
+	blockFile  string
+	sysLogFile string
+	maxFail    int // 单IP最大失败次数
 }
 
 // IP认证错误记录器
 type IPAuthTracker struct {
 	mu                    sync.RWMutex
-	failedCount           map[string]int  // IP -> 失败次数
-	blockedIPs            map[string]bool // 已拉黑IP
-	blockFile             string          // 拉黑IP存储文件路径
-	sysLogFile            string          // 系统日志文件路径
-	selfDestructThreshold int             // 自裁保护阈值（拉黑IP数量）
+	failedCount           map[string]int
+	blockedIPs            map[string]bool
+	blockFile             string
+	sysLogFile            string
+	selfDestructThreshold int
+	maxAttempts           int // 单IP失败次数阈值
 }
 
-// 只读文件系统包装器，禁用所有写操作（适配新版API）
+// 只读文件系统包装器
 type ReadOnlyFileSystem struct {
 	webdav.FileSystem
 }
 
 // 初始化IP追踪器
-func NewIPAuthTracker(blockFile, sysLogFile string) (*IPAuthTracker, error) {
+func NewIPAuthTracker(blockFile, sysLogFile string, maxAttempts int) (*IPAuthTracker, error) {
 	// 主动创建空的拉黑IP文件（若不存在）
 	if _, err := os.Stat(blockFile); os.IsNotExist(err) {
 		f, err := os.OpenFile(blockFile, os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			return nil, fmt.Errorf("创建拉黑IP文件失败: %v", err)
+			return nil, fmt.Errorf("failed to create blacklist file: %v", err)
 		}
 		f.Close()
-		log.Printf("已创建空的拉黑IP文件: %s", blockFile)
+		log.Printf("Created empty blacklist file: %s", blockFile)
 	}
 
 	tracker := &IPAuthTracker{
@@ -65,12 +69,13 @@ func NewIPAuthTracker(blockFile, sysLogFile string) (*IPAuthTracker, error) {
 		blockedIPs:            make(map[string]bool),
 		blockFile:             blockFile,
 		sysLogFile:            sysLogFile,
-		selfDestructThreshold: 50, // 拉黑IP达到50个触发自裁保护
+		selfDestructThreshold: 50,
+		maxAttempts:           maxAttempts,
 	}
 
 	// 启动时加载已拉黑的IP
 	if err := tracker.LoadBlockedIPs(); err != nil {
-		return nil, fmt.Errorf("加载拉黑IP失败: %v", err)
+		return nil, fmt.Errorf("failed to load blacklist: %v", err)
 	}
 
 	// 检查初始拉黑IP数量是否已达阈值
@@ -81,79 +86,63 @@ func NewIPAuthTracker(blockFile, sysLogFile string) (*IPAuthTracker, error) {
 
 // 加载拉黑IP文件（Base64解码）
 func (t *IPAuthTracker) LoadBlockedIPs() error {
-	// 检查文件是否存在
 	if _, err := os.Stat(t.blockFile); os.IsNotExist(err) {
-		log.Printf("拉黑IP文件不存在: %s", t.blockFile)
+		log.Printf("Blacklist file does not exist: %s", t.blockFile)
 		return nil
 	}
 
-	// 读取文件内容
 	data, err := os.ReadFile(t.blockFile)
 	if err != nil {
-		return fmt.Errorf("读取拉黑IP文件失败: %v", err)
+		return fmt.Errorf("failed to read blacklist file: %v", err)
 	}
 
-	// 按行解析（每行一个Base64编码的IP）
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
-		// 跳过空行/空白行
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
 
-		// Base64解码
 		ipBytes, err := base64.StdEncoding.DecodeString(string(line))
 		if err != nil {
-			log.Printf("Base64解码IP失败，跳过该行: %s, 错误: %v", string(line), err)
+			log.Printf("Base64 decode failed for line: %s, error: %v", string(line), err)
 			continue
 		}
-
 		ipStr := string(ipBytes)
 		t.mu.Lock()
 		t.blockedIPs[ipStr] = true
 		t.mu.Unlock()
-		log.Printf("加载拉黑IP: %s", ipStr)
+		log.Printf("Loaded blacklisted IP: %s", ipStr)
 	}
-
-	log.Printf("共加载 %d 个拉黑IP", len(t.blockedIPs))
+	log.Printf("Loaded %d blacklisted IPs", len(t.blockedIPs))
 	return nil
 }
 
 // 保存拉黑IP到文件（Base64编码）
 func (t *IPAuthTracker) SaveBlockedIP(ip string) error {
-	// IP格式校验
 	if net.ParseIP(ip) == nil {
-		return fmt.Errorf("无效的IP地址: %s", ip)
+		return fmt.Errorf("invalid IP address: %s", ip)
 	}
 
-	// Base64编码IP
 	encodedIP := base64.StdEncoding.EncodeToString([]byte(ip))
 
-	// 追加写入文件（每行一个）
-	f, err := os.OpenFile(t.blockFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(t.blockFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		return fmt.Errorf("打开拉黑IP文件失败: %v", err)
+		return fmt.Errorf("failed to open blacklist file: %v", err)
 	}
 	defer f.Close()
 
-	_, err = f.WriteString(encodedIP + "\n")
-	if err != nil {
-		return fmt.Errorf("写入拉黑IP文件失败: %v", err)
+	if _, err := f.WriteString(encodedIP + "\n"); err != nil {
+		return fmt.Errorf("failed to write blacklist: %v", err)
 	}
 
-	// 更新内存中的拉黑列表
 	t.mu.Lock()
 	t.blockedIPs[ip] = true
-	// 清除该IP的失败次数
 	delete(t.failedCount, ip)
 	t.mu.Unlock()
 
-	log.Printf("IP已拉黑并保存: %s (Base64: %s)", ip, encodedIP)
-
-	// 检查是否触发自裁保护
+	log.Printf("IP %s blacklisted and saved", ip)
 	t.checkSelfDestruct()
-
 	return nil
 }
 
@@ -164,55 +153,41 @@ func (t *IPAuthTracker) checkSelfDestruct() {
 	t.mu.RUnlock()
 
 	if blockedCount >= t.selfDestructThreshold {
-		// 写入sys.log日志（中英文）
-		logMsg := fmt.Sprintf("[%s] 遭遇攻击，自裁保护 | Under attack, self-destruct protection triggered. 拉黑IP数量: %d",
+		logMsg := fmt.Sprintf("[%s] Under attack, self-destruct triggered. Blacklisted IPs: %d",
 			time.Now().Format("2006-01-02 15:04:05"), blockedCount)
-
-		// 追加写入sys.log
 		f, err := os.OpenFile(t.sysLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("写入sys.log失败: %v", err)
-		} else {
+		if err == nil {
 			f.WriteString(logMsg + "\n")
 			f.Close()
 		}
-
-		// 控制台打印日志
 		log.Println(logMsg)
-
-		// 自裁保护：退出程序
-		log.Fatal("自裁保护触发，程序退出 | Self-destruct protection triggered, exiting program.")
+		log.Fatal("Self-destruct protection triggered, exiting.")
 	}
 }
 
-// 记录认证失败并检查是否需要拉黑（三次失败拉黑）
+// 记录认证失败并检查是否需要拉黑
 func (t *IPAuthTracker) RecordFailedAuth(ip string) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// 检查是否已拉黑
 	if t.blockedIPs[ip] {
 		return true, nil
 	}
 
-	// 增加失败次数
 	t.failedCount[ip]++
 	count := t.failedCount[ip]
-	log.Printf("IP %s 认证失败次数: %d", ip, count)
+	log.Printf("IP %s authentication failures: %d", ip, count)
 
-	// 三次失败则拉黑
-	if count >= 3 {
+	if count >= t.maxAttempts {
 		t.blockedIPs[ip] = true
-		// 异步保存到文件（避免阻塞请求）
 		go func(ip string) {
 			if err := t.SaveBlockedIP(ip); err != nil {
-				log.Printf("保存拉黑IP失败: %v", err)
+				log.Printf("Failed to save blacklisted IP: %v", err)
 			}
 		}(ip)
-		log.Printf("IP %s 因三次认证失败被永久拉黑", ip)
+		log.Printf("IP %s blacklisted due to %d failures", ip, t.maxAttempts)
 		return true, nil
 	}
-
 	return false, nil
 }
 
@@ -225,23 +200,16 @@ func (t *IPAuthTracker) IsBlocked(ip string) bool {
 
 // 获取客户端真实IP
 func getClientIP(r *http.Request) string {
-	// 优先获取X-Forwarded-For（反向代理场景）
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// 取第一个IP
 		if before, _, ok := strings.Cut(xff, ","); ok {
 			return strings.TrimSpace(before)
 		}
 		return strings.TrimSpace(xff)
 	}
-
-	// 其次获取X-Real-IP
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return strings.TrimSpace(xri)
 	}
-
-	// 直接获取远程地址
 	remoteAddr := r.RemoteAddr
-	// 解析IP:端口
 	ip, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return remoteAddr
@@ -249,207 +217,207 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
+// 递归解码URL路径，防止双重编码绕过
+func decodePathRecursively(encodedPath string) (string, error) {
+	decoded, err := url.PathUnescape(encodedPath)
+	if err != nil {
+		return "", err
+	}
+	if decoded != encodedPath {
+		return decodePathRecursively(decoded)
+	}
+	return decoded, nil
+}
+
 // 带IP拉黑的认证中间件
 func authWithIPBlock(next http.Handler, validUser, validPass string, tracker *IPAuthTracker) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. 获取客户端IP
 		clientIP := getClientIP(r)
-		log.Printf("收到请求，客户端IP: %s, 路径: %s", clientIP, r.URL.Path)
+		log.Printf("Request from %s, path: %s", clientIP, r.URL.Path)
 
-		// 2. 检查IP是否被拉黑
-		if tracker.IsBlocked(clientIP) {
-			http.Error(w, "请继续再次尝试连接", http.StatusForbidden)
-			log.Printf("拉黑IP %s 尝试访问，已拒绝", clientIP)
+		rawPath := r.URL.EscapedPath()
+		if rawPath == "" {
+			rawPath = r.URL.Path
+		}
+		safePath, err := decodePathRecursively(rawPath)
+		if err != nil || strings.Contains(safePath, "..") {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			log.Printf("Path traversal attempt blocked: %s -> %s", r.URL.Path, safePath)
 			return
 		}
 
-		// 3. 验证账号密码
-		user, pass, ok := r.BasicAuth()
-		// 新增：第一步就拦截含..的URL，直接拒绝
-		if strings.Contains(r.URL.Path, "..") {
-			ok = false
+		if tracker.IsBlocked(clientIP) {
+			http.Error(w, "Please try again later", http.StatusForbidden)
+			log.Printf("Blocked IP %s attempted access", clientIP)
+			return
 		}
 
+		user, pass, ok := r.BasicAuth()
 		if !ok || user != validUser || pass != validPass {
-			// 记录认证失败
-			isBlocked, err := tracker.RecordFailedAuth(clientIP)
-			if err != nil {
-				log.Printf("记录认证失败失败: %v", err)
-			}
-
-			// 拉黑则返回403，否则返回401
+			isBlocked, _ := tracker.RecordFailedAuth(clientIP)
 			if isBlocked {
-				http.Error(w, "请继续再次尝试连接，重试连接", http.StatusForbidden)
+				http.Error(w, "Please try again later", http.StatusForbidden)
 			} else {
 				w.Header().Set("WWW-Authenticate", `Basic realm="WebDAV Server"`)
-				http.Error(w, "认证失败", http.StatusUnauthorized)
+				http.Error(w, "Authentication failed", http.StatusUnauthorized)
 			}
 			return
 		}
 
-		// 4. 认证成功，清除失败次数
 		tracker.mu.Lock()
 		delete(tracker.failedCount, clientIP)
 		tracker.mu.Unlock()
 
-		// 5. 处理请求
 		next.ServeHTTP(w, r)
 	})
 }
 
-// 重写Mkdir方法，返回权限错误（新版API使用context.Context）
+// 只读文件系统包装器
 func (r *ReadOnlyFileSystem) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	return os.ErrPermission
 }
-
-// 重写OpenFile方法，仅允许只读模式
 func (r *ReadOnlyFileSystem) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
-	// 禁止所有写操作相关的flag
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
 		return nil, os.ErrPermission
 	}
-	// 强制以只读模式打开
 	return r.FileSystem.OpenFile(ctx, name, os.O_RDONLY, perm)
 }
-
-// 重写RemoveAll方法，返回权限错误
 func (r *ReadOnlyFileSystem) RemoveAll(ctx context.Context, name string) error {
 	return os.ErrPermission
 }
-
-// 重写Rename方法，返回权限错误
 func (r *ReadOnlyFileSystem) Rename(ctx context.Context, oldName, newName string) error {
 	return os.ErrPermission
 }
-
-// 重写Stat方法，保持原有功能
 func (r *ReadOnlyFileSystem) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	return r.FileSystem.Stat(ctx, name)
 }
 
-// 验证账号密码长度
 func validateCredentials(username, password string) error {
 	if len(username) < 6 {
-		return fmt.Errorf("用户名长度不能少于6个字符")
+		return fmt.Errorf("username must be at least 6 characters")
 	}
 	if len(password) < 14 {
-		return fmt.Errorf("密码长度不能少于14个字符")
+		return fmt.Errorf("password must be at least 14 characters")
 	}
 	return nil
 }
 
 func main() {
-	// 定义命令行参数
 	var config Config
-	flag.BoolVar(&config.ssl, "ssl", false, "是否启用SSL/TLS加密 (true/false)")
-	flag.StringVar(&config.certFile, "cert", "server.crt", "SSL证书文件路径 (启用SSL时必填)")
-	flag.StringVar(&config.keyFile, "key", "server.key", "SSL私钥文件路径 (启用SSL时必填)")
-	flag.StringVar(&config.addr, "addr", ":8080", "服务器监听地址")
+	flag.BoolVar(&config.ssl, "ssl", false, "Enable SSL/TLS encryption")
+	flag.StringVar(&config.certFile, "cert", "server.crt", "SSL certificate file")
+	flag.StringVar(&config.keyFile, "key", "server.key", "SSL private key file")
+	flag.StringVar(&config.addr, "addr", ":8080", "Listen address (must be in format :port)")
+	flag.IntVar(&config.maxFail, "max-fail", 10, "Max authentication failures per IP before blacklisting")
 	flag.Parse()
 
-	// 内置账号密码（满足长度要求：用户6位+，密码14位+）
-	config.username = "webdavuser"
-	config.password = "71235*&^-12-NNjj_VVV"
-
-	// 验证内置账号密码长度
-	if err := validateCredentials(config.username, config.password); err != nil {
-		log.Fatalf("账号密码验证失败: %v", err)
+	// 检查 addr 格式：必须以 ":" 开头且后面为数字端口
+	if !strings.HasPrefix(config.addr, ":") {
+		log.Fatalf("Invalid listen address format: %s. Must be like :7047", config.addr)
+	}
+	portStr := config.addr[1:]
+	if _, err := strconv.Atoi(portStr); err != nil {
+		log.Fatalf("Port must be a number, got: %s", portStr)
 	}
 
-	// 获取当前可执行文件目录
+	config.username = "webdavuser"
+	config.password = "71235*&^-12-NNjj_VVV"
+	if err := validateCredentials(config.username, config.password); err != nil {
+		log.Fatalf("Credential validation failed: %v", err)
+	}
+
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatalf("获取可执行文件路径失败: %v", err)
+		log.Fatalf("Failed to get executable path: %v", err)
 	}
 	exeDir := filepath.Dir(exePath)
 
-	// 设置WebDAV根目录为可执行文件同级的FILES文件夹
-	config.rootDir = filepath.Join(exeDir, "FILES")
-
-	// 设置拉黑IP存储目录和文件（exe同级/his_store_bak/blocked_ips.txt）
+	// 根目录（可自行修改）
+	config.rootDir = "/home/aria"
 	config.blockDir = filepath.Join(exeDir, "his_store_bak")
 	config.blockFile = filepath.Join(config.blockDir, "blocked_ips.txt")
-	// 设置系统日志文件（exe同级/sys.log）
 	config.sysLogFile = filepath.Join(exeDir, "sys.log")
 
-	// 检查FILES目录是否存在，不存在则创建
-	if _, err := os.Stat(config.rootDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(config.rootDir, 0755); err != nil {
-			log.Fatalf("创建FILES目录失败: %v", err)
-		}
-		log.Printf("已创建FILES目录: %s", config.rootDir)
+	// 创建必要的目录
+	if err := os.MkdirAll(config.rootDir, 0755); err != nil {
+		log.Fatalf("Failed to create root directory: %v", err)
+	}
+	if err := os.MkdirAll(config.blockDir, 0755); err != nil {
+		log.Fatalf("Failed to create blacklist directory: %v", err)
 	}
 
-	// 检查拉黑IP目录是否存在，不存在则创建
-	if _, err := os.Stat(config.blockDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(config.blockDir, 0755); err != nil {
-			log.Fatalf("创建拉黑IP目录失败: %v", err)
-		}
-		log.Printf("已创建拉黑IP目录: %s", config.blockDir)
-	}
-
-	// 初始化IP认证追踪器（传入系统日志文件路径）
-	tracker, err := NewIPAuthTracker(config.blockFile, config.sysLogFile)
+	tracker, err := NewIPAuthTracker(config.blockFile, config.sysLogFile, config.maxFail)
 	if err != nil {
-		log.Fatalf("初始化IP追踪器失败: %v", err)
+		log.Fatalf("Failed to initialize IP tracker: %v", err)
 	}
 
-	// 创建只读文件系统实例
-	fs := &ReadOnlyFileSystem{
-		FileSystem: webdav.Dir(config.rootDir),
-	}
-
-	// 配置WebDAV处理器（适配新版API）
+	fs := &ReadOnlyFileSystem{FileSystem: webdav.Dir(config.rootDir)}
 	handler := &webdav.Handler{
 		FileSystem: fs,
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
-				log.Printf("WebDAV操作错误: %s %s -> %v", r.Method, r.URL.Path, err)
+				log.Printf("WebDAV error: %s %s -> %v", r.Method, r.URL.Path, err)
 			}
 		},
 	}
-
-	// 包装带IP拉黑的认证中间件
 	authHandler := authWithIPBlock(handler, config.username, config.password, tracker)
 
-	// 打印启动信息
-	log.Printf("=== WebDAV 服务器启动配置 ===")
-	log.Printf("监听地址: %s", config.addr)
-	log.Printf("文件根目录: %s", config.rootDir)
-	log.Printf("SSL加密: %t", config.ssl)
-	log.Printf("认证用户: %s", config.username)
-	log.Printf("拉黑IP存储文件: %s", config.blockFile)
-	log.Printf("系统日志文件: %s", config.sysLogFile)
-	log.Printf("自裁保护阈值: %d个拉黑IP", tracker.selfDestructThreshold)
-	log.Printf("当前拉黑IP数量: %d", len(tracker.blockedIPs))
+	log.Printf("=== WebDAV Server Configuration ===")
+	log.Printf("Listen address: %s (dual-stack: IPv4 + IPv6)", config.addr)
+	log.Printf("Root directory: %s", config.rootDir)
+	log.Printf("SSL: %t", config.ssl)
+	log.Printf("User: %s", config.username)
+	log.Printf("Blacklist file: %s", config.blockFile)
+	log.Printf("System log: %s", config.sysLogFile)
+	log.Printf("Max failures per IP: %d", config.maxFail)
+	log.Printf("Self-destruct threshold: %d IPs", tracker.selfDestructThreshold)
+	log.Printf("Current blacklist count: %d", len(tracker.blockedIPs))
 	log.Printf("==============================")
 
-	// 根据SSL配置启动服务器
+	// 提取端口（例如 :7047）
+	port := config.addr
+
+	// 启动服务器的辅助函数
+	/*startServer := func(network, listenAddr string, useSSL bool) {
+		srv := &http.Server{
+			Addr:         listenAddr,
+			Handler:      authHandler,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 0,
+			IdleTimeout:  0,
+		}
+		if useSSL {
+			tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+			srv.TLSConfig = tlsConfig
+			log.Printf("Starting %s (SSL) server on %s", network, listenAddr)
+			if err := srv.ListenAndServeTLS(config.certFile, config.keyFile); err != nil {
+				log.Fatalf("%s server error: %v", network, err)
+			}
+		} else {
+			log.Printf("Starting %s (HTTP) server on %s", network, listenAddr)
+			if err := srv.ListenAndServe(); err != nil {
+				log.Fatalf("%s server error: %v", network, err)
+			}
+		}
+	}
+
+	// 双栈监听：分别使用 tcp4 和 tcp6
 	if config.ssl {
-		// 检查SSL证书/私钥文件是否存在
+		// 检查证书文件
 		if _, err := os.Stat(config.certFile); os.IsNotExist(err) {
-			log.Fatalf("SSL证书文件不存在: %s", config.certFile)
+			log.Fatalf("SSL certificate file not found: %s", config.certFile)
 		}
 		if _, err := os.Stat(config.keyFile); os.IsNotExist(err) {
-			log.Fatalf("SSL私钥文件不存在: %s", config.keyFile)
+			log.Fatalf("SSL key file not found: %s", config.keyFile)
 		}
-
-		// 配置TLS（强制TLS 1.2+，提升安全性）
-		tlsConfig := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
-
-		server := &http.Server{
-			Addr:      config.addr,
-			Handler:   authHandler,
-			TLSConfig: tlsConfig,
-		}
-
-		log.Println("启动HTTPS WebDAV服务器（SSL加密）")
-		log.Fatal(server.ListenAndServeTLS(config.certFile, config.keyFile))
+		// IPv4 监听 (0.0.0.0:port)
+		//go startServer("tcp4", "0.0.0.0"+port, true)
+		// IPv6 监听 ([::]:port) — 阻塞主 goroutine
+		startServer("tcp6", "[::]"+port, true)
 	} else {
-		log.Println("启动HTTP WebDAV服务器（非加密）")
-		log.Fatal(http.ListenAndServe(config.addr, authHandler))
+		// HTTP 模式
+		//go startServer("tcp4", "0.0.0.0"+port, false)
+		startServer("tcp6", "[::]"+port, false)
 	}
 }
