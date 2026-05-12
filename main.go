@@ -13,9 +13,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/webdav"
@@ -379,7 +381,54 @@ func main() {
 	port := config.addr
 
 	// 启动服务器的辅助函数
-	/*startServer := func(network, listenAddr string, useSSL bool) {
+	startServer := func(network, listenAddr string, useSSL bool) {
+		// 如果是 OpenBSD，强制使用手动 Listener 模式以支持 IPv6 独立监听
+		if runtime.GOOS == "openbsd" {
+			srv := &http.Server{
+				Addr:         listenAddr,
+				Handler:      authHandler,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 0,
+				IdleTimeout:  0,
+			}
+
+			var ln net.Listener
+			var err error
+
+			if network == "tcp6" {
+				lc := net.ListenConfig{
+					Control: func(network, address string, c syscall.RawConn) error {
+						return c.Control(func(fd uintptr) {
+							// OpenBSD 默认通常就是 1，这里显式设置确保万无一失
+							syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1)
+						})
+					},
+				}
+				ln, err = lc.Listen(context.Background(), network, listenAddr)
+			} else {
+				ln, err = net.Listen(network, listenAddr)
+			}
+
+			if err != nil {
+				log.Fatalf("%s 监听失败: %v", network, err)
+			}
+
+			if useSSL {
+				srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+				log.Printf("Starting %s (SSL) server on %s (OpenBSD mode)", network, listenAddr)
+				if err := srv.ServeTLS(ln, config.certFile, config.keyFile); err != nil && err != http.ErrServerClosed {
+					log.Fatalf("%s server error: %v", network, err)
+				}
+			} else {
+				log.Printf("Starting %s (HTTP) server on %s (OpenBSD mode)", network, listenAddr)
+				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					log.Fatalf("%s server error: %v", network, err)
+				}
+			}
+			return // OpenBSD 逻辑结束，直接返回
+		}
+
+		// 非 OpenBSD 系统，维持你原来的逻辑
 		srv := &http.Server{
 			Addr:         listenAddr,
 			Handler:      authHandler,
@@ -412,12 +461,12 @@ func main() {
 			log.Fatalf("SSL key file not found: %s", config.keyFile)
 		}
 		// IPv4 监听 (0.0.0.0:port)
-		//go startServer("tcp4", "0.0.0.0"+port, true)
+		go startServer("tcp4", "0.0.0.0"+port, true)
 		// IPv6 监听 ([::]:port) — 阻塞主 goroutine
 		startServer("tcp6", "[::]"+port, true)
 	} else {
 		// HTTP 模式
-		//go startServer("tcp4", "0.0.0.0"+port, false)
+		go startServer("tcp4", "0.0.0.0"+port, false)
 		startServer("tcp6", "[::]"+port, false)
 	}
 }
